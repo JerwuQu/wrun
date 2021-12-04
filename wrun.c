@@ -33,13 +33,6 @@ void err(const char *msg)
 #define VEC_TYPE char*
 #include "vec.h"
 
-typedef struct {
-	char *menuCmd;
-	bool daemonize;
-	bool indexStartMenu, indexEnvPath;
-	vec_str_t customPaths;
-} config_t;
-
 typedef enum {
 	WRENT_START,
 	WRENT_PATH,
@@ -179,7 +172,6 @@ int _index_compare(const void *a, const void *b)
 
 void organizeIndex()
 {
-	// TODO: use saved recency/history for ordering
 	qsort(gIndex.entries.data, gIndex.entries.count, sizeof(entry_t), _index_compare);
 }
 
@@ -245,10 +237,12 @@ void showMenu(char *menuCmd)
 
 void usage()
 {
+	// TODO: daemonize flag: run in background and accept window message to show menu
+	// TODO: flag to use recency/history for better menu ordering
+	// TODO: flag to enable sub-actions (aside from launch), stuff like "Open Directory" and "Remove from History"
 	fprintf(stderr, "wrun <OPTIONS>\n"
 		"USAGE:\n"
 		"\t-menu <menu cmd>  menu command to invoke (required)\n"
-		"\t-daemon           daemonize wrun and index in the background\n"
 		"\t-Nstart           don't index start menu\n"
 		"\t-Npath            don't index PATH\n"
 		"\t+index <path>     index a custom path\n"
@@ -258,45 +252,36 @@ void usage()
 
 int main(int argc, char **argv)
 {
-	config_t config = {
-		.menuCmd = NULL,
-		.daemonize = false,
-		.indexStartMenu = true,
-		.indexEnvPath = true,
-	};
+	char *menuCmd = NULL;
+	bool doIndexStartMenu = true, doIndexEnvPath = true;
+	vec_str_t customPaths = {0};
 
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-daemon")) {
-			config.daemonize = true;
-		} else if (!strcmp(argv[i], "-Nstart")) {
-			config.indexStartMenu = false;
+		if (!strcmp(argv[i], "-Nstart")) {
+			doIndexStartMenu = false;
 		} else if (!strcmp(argv[i], "-Npath")) {
-			config.indexEnvPath = false;
+			doIndexEnvPath = false;
 		} else if (i + 1 == argc) {
 			usage();
 		} else if (!strcmp(argv[i], "-menu")) {
-			config.menuCmd = argv[++i];
+			menuCmd = argv[++i];
 		} else if (!strcmp(argv[i], "+index")) {
-			vec_str_push(&config.customPaths, argv[++i]);
+			vec_str_push(&customPaths, argv[++i]);
 		} else {
 			usage();
 		}
 	}
-	if (!config.menuCmd) {
+	if (!menuCmd) {
 		usage();
 	}
 
-	if (config.daemonize) {
-		err("TODO");
-	} else {
-		if (config.indexStartMenu) indexStartMenu();
-		if (config.indexEnvPath) indexEnvPath();
-		for (size_t i = 0; i < config.customPaths.count; i++) {
-			indexCustomPath(config.customPaths.data[i]);
-		}
-		organizeIndex();
-		showMenu(config.menuCmd);
+	if (doIndexStartMenu) indexStartMenu();
+	if (doIndexEnvPath) indexEnvPath();
+	for (size_t i = 0; i < customPaths.count; i++) {
+		indexCustomPath(customPaths.data[i]);
 	}
+	organizeIndex();
+	showMenu(menuCmd);
 
 	return 0;
 }
