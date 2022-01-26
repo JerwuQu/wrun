@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <assert.h>
+
+// NOTE: hashmap.h is currently used in quite a hacky manner, storing ints instead of pointers
+#include "hashmap.h"
 
 #define VEC_IMPL
 #define VEC_INIT_SIZE 1024
@@ -14,7 +18,6 @@
 
 #define u16 uint16_t
 #define u32 uint32_t
-#define u32_MAX 0xffffffff
 
 #define WASSERT(result) do { \
 		if (!(result)) { \
@@ -43,6 +46,7 @@ typedef struct {
 	u16 titleLen, pathLen;
 	u32 title; // char* in arena
 	u32 path; // wchar_t* in arena
+	u32 historyScore;
 	index_source_t source;
 } entry_t;
 
@@ -54,6 +58,8 @@ struct {
 	vec_entry_t entries;
 	vec_char_t arena;
 } gIndex;
+
+struct hashmap_s gHistoryMap;
 
 u32 arenaAppend(const void *data, u32 sz)
 {
@@ -73,12 +79,14 @@ void indexAppend(const wchar_t *path, index_source_t source)
 	WASSERT(titleLen);
 
 	const u32 pathLen = wcslen(path);
+	const u32 historyScore = (size_t)hashmap_get(&gHistoryMap, (const char*)path, pathLen * sizeof(wchar_t));
 	vec_entry_push(&gIndex.entries, (entry_t) {
 		.source = source,
 		.pathLen = pathLen,
 		.path = arenaAppend(path, pathLen * sizeof(wchar_t)),
 		.titleLen = titleLen,
 		.title = arenaAppend(title, titleLen),
+		.historyScore = historyScore,
 	});
 }
 
@@ -157,16 +165,57 @@ void indexCustomPath(const char *path)
 	indexDir(wpath, 0, WRENT_CUSTOM, 0);
 }
 
+void loadHistory(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (f) {
+		u16 pathBinLen;
+		u32 historyScore;
+		while (fread(&historyScore, 4, 1, f) == 1) {
+			assert(fread(&pathBinLen, 2, 1, f) == 1);
+			assert(pathBinLen && pathBinLen < MAX_PATH * sizeof(wchar_t));
+			char *pathBin = malloc(pathBinLen);
+			assert(fread(pathBin, pathBinLen, 1, f) == 1);
+			hashmap_put(&gHistoryMap, pathBin, pathBinLen, (void*)(size_t)historyScore);
+		}
+		fclose(f);
+	}
+}
+
+int _saveHistoryEntry(void *ctx, struct hashmap_element_s *entry)
+{
+	// History is stored as: <launch count:u32><path byte len:u16><path bytes>
+	FILE *f = ctx;
+	const u32 historyScore = (size_t)entry->data;
+	assert(fwrite(&historyScore, 4, 1, f) == 1);
+	const u16 pathBinLen = entry->key_len;
+	assert(fwrite(&pathBinLen, 2, 1, f) == 1);
+	assert(fwrite(entry->key, pathBinLen, 1, f) == 1);
+	return 0;
+}
+
+void saveHistory(const char *path)
+{
+	FILE *f = fopen(path, "w");
+	assert(f);
+	hashmap_iterate_pairs(&gHistoryMap, _saveHistoryEntry, f);
+	fclose(f);
+}
+
 int _index_compare(const void *a, const void *b)
 {
 	const entry_t *ea = a, *eb = b;
-	if (ea->source == eb->source) {
-		return strncmp(
-				&gIndex.arena.data[ea->title],
-				&gIndex.arena.data[eb->title],
-				min(ea->titleLen, eb->titleLen));
+	if (ea->historyScore == eb->historyScore) {
+		if (ea->source == eb->source) {
+			return strncmp(
+					&gIndex.arena.data[ea->title],
+					&gIndex.arena.data[eb->title],
+					min(ea->titleLen, eb->titleLen));
+		} else {
+			return ea->source - eb->source;
+		}
 	} else {
-		return ea->source - eb->source;
+		return eb->historyScore - ea->historyScore;
 	}
 }
 
@@ -177,6 +226,7 @@ void organizeIndex()
 
 void showMenu(char *menuCmd)
 {
+	// Create pipes for menu
 	SECURITY_ATTRIBUTES sa = {
 		.nLength = sizeof(SECURITY_ATTRIBUTES),
 		.bInheritHandle = TRUE,
@@ -187,6 +237,7 @@ void showMenu(char *menuCmd)
 	SetHandleInformation(stdinW, HANDLE_FLAG_INHERIT, 0);
 	SetHandleInformation(stdoutR, HANDLE_FLAG_INHERIT, 0);
 
+	// Open menu
 	PROCESS_INFORMATION pi;
 	STARTUPINFO si = {
 		.cb = sizeof(STARTUPINFO),
@@ -199,6 +250,7 @@ void showMenu(char *menuCmd)
 	CloseHandle(stdinR);
 	CloseHandle(stdoutW);
 
+	// Send menu to stdin and close stdin
 	for (u32 i = 0; i < gIndex.entries.count; i++) {
 		char str[MAX_PATH + 128];
 		const entry_t *entry = &gIndex.entries.data[i];
@@ -209,6 +261,7 @@ void showMenu(char *menuCmd)
 	}
 	CloseHandle(stdinW);
 
+	// Read output
 	char out[32];
 	const DWORD readMax = sizeof(out) - 1;
 	DWORD totRead = 0, lastRead;
@@ -217,10 +270,12 @@ void showMenu(char *menuCmd)
 	}
 	out[totRead] = 0; // nullterm
 
+	// Clean up
 	CloseHandle(stdoutR);
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);
 
+	// Validate choice
 	int choice;
 	if (!StrToIntExA(out, STIF_SUPPORT_HEX, &choice) || choice < 0) {
 		err("no choice");
@@ -228,21 +283,27 @@ void showMenu(char *menuCmd)
 		err("choice out of range");
 	}
 
+	// Open choice
 	entry_t *chosen = &gIndex.entries.data[choice];
 	wchar_t path[MAX_PATH];
 	memcpy(path, &gIndex.arena.data[chosen->path], chosen->pathLen * sizeof(wchar_t));
 	path[chosen->pathLen] = 0; // nullterm
 	ShellExecuteW(0, L"open", L"explorer", path, 0, SW_SHOW);
+
+	// Put in history
+	hashmap_put(&gHistoryMap,
+			&gIndex.arena.data[chosen->path], chosen->pathLen * sizeof(wchar_t),
+			(void*)(size_t)(chosen->historyScore + 1));
 }
 
 void usage()
 {
 	// TODO: daemonize flag: run in background and accept window message to show menu
-	// TODO: flag to use recency/history for better menu ordering
 	// TODO: flag to enable sub-actions (aside from launch), stuff like "Open Directory" and "Remove from History"
 	fprintf(stderr, "wrun <OPTIONS>\n"
 		"USAGE:\n"
 		"\t-menu <menu cmd>  menu command to invoke (required)\n"
+		"\t-Nhistory         don't load or save history\n"
 		"\t-Nstart           don't index start menu\n"
 		"\t-Npath            don't index PATH\n"
 		"\t+index <path>     index a custom path\n"
@@ -252,12 +313,18 @@ void usage()
 
 int main(int argc, char **argv)
 {
+	char historyPath[MAX_PATH];
+	strcpy(historyPath, getenv("APPDATA"));
+	strcat(historyPath, "/wrun_history.bin");
+
 	char *menuCmd = NULL;
-	bool doIndexStartMenu = true, doIndexEnvPath = true;
+	bool useHistory = true, doIndexStartMenu = true, doIndexEnvPath = true;
 	vec_str_t customPaths = {0};
 
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-Nstart")) {
+		if (!strcmp(argv[i], "-Nhistory")) {
+			useHistory = false;
+		} else if (!strcmp(argv[i], "-Nstart")) {
 			doIndexStartMenu = false;
 		} else if (!strcmp(argv[i], "-Npath")) {
 			doIndexEnvPath = false;
@@ -275,6 +342,11 @@ int main(int argc, char **argv)
 		usage();
 	}
 
+	assert(!hashmap_create(1024, &gHistoryMap));
+	if (useHistory) {
+		loadHistory(historyPath);
+	}
+
 	if (doIndexStartMenu) indexStartMenu();
 	if (doIndexEnvPath) indexEnvPath();
 	for (size_t i = 0; i < customPaths.count; i++) {
@@ -282,6 +354,10 @@ int main(int argc, char **argv)
 	}
 	organizeIndex();
 	showMenu(menuCmd);
+
+	if (useHistory) {
+		saveHistory(historyPath);
+	}
 
 	return 0;
 }
