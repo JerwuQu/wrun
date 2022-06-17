@@ -30,7 +30,7 @@ void err(const char *msg)
 	exit(1);
 }
 
-const std::set<std::string> INDEX_EXTS = { ".exe", ".lnk", ".bat", ".cmd", ".com" };
+const std::set<std::string> INDEX_EXTS = { ".exe", ".lnk", ".bat", ".cmd", ".com", ".url" };
 
 enum IndexSource {
 	WRENT_START,
