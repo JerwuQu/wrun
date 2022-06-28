@@ -107,7 +107,7 @@ void indexCustomPath(const fs::path& path)
 
 void loadHistory(const fs::path& path)
 {
-	FILE *f = fopen(path.lexically_normal().string().c_str(), "r"); // TODO: use C++
+	FILE *f = fopen(path.lexically_normal().string().c_str(), "rb"); // TODO: use C++
 	if (f) {
 		u16 pathBinLen;
 		u32 historyScore;
@@ -125,7 +125,7 @@ void loadHistory(const fs::path& path)
 
 void saveHistory(const fs::path& path)
 {
-	FILE *f = fopen(path.lexically_normal().string().c_str(), "w"); // TODO: use C++
+	FILE *f = fopen(path.lexically_normal().string().c_str(), "wb"); // TODO: use C++
 	assert(f);
 	for (auto& entry : gHistory) {
 		// History is stored as: <launch count:u32><path byte len:u16><path bytes>
