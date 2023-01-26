@@ -4,6 +4,7 @@
 #include <map>
 #include <algorithm>
 #include <filesystem>
+#include <future>
 
 #include <cassert> // TODO remove
 #include <cstring> // TODO remove
@@ -24,11 +25,6 @@ namespace fs = std::filesystem;
 		} \
 	} while (0);
 
-void err(const char *msg)
-{
-	fprintf(stderr, "%s\n", msg);
-	exit(1);
-}
 
 const std::set<std::string> INDEX_EXTS = { ".exe", ".lnk", ".bat", ".cmd", ".com", ".url" };
 
@@ -43,6 +39,19 @@ struct Entry {
 	std::u8string title;
 	fs::path path; // lexically_normalized
 	IndexSource source;
+};
+
+struct PendingMenuProcess {
+	PROCESS_INFORMATION pi;
+	HANDLE stdinW, stdoutR;
+};
+
+struct DaemonData {
+	char *menuCmd;
+	bool useHistory;
+	std::filesystem::path historyPath;
+	PendingMenuProcess menu;
+	std::future<void> menuFuture;
 };
 
 std::vector<Entry> gEntries;
@@ -155,7 +164,9 @@ void organizeIndex()
 	});
 }
 
-void showMenu(char *menuCmd)
+// Opening the menu is split into `launchMenu` and `showMenu`
+// This makes it so that showing the menu is essentially instant
+PendingMenuProcess launchMenu(char *menuCmd)
 {
 	// TODO: switch to C++ methods
 	// Create pipes for menu
@@ -182,33 +193,47 @@ void showMenu(char *menuCmd)
 	CloseHandle(stdinR);
 	CloseHandle(stdoutW);
 
-	// Send menu to stdin and close stdin
+	// Send menu to stdin
 	for (Entry& entry : gEntries) {
 		WriteFile(stdinW, entry.title.c_str(), entry.title.length(), NULL, NULL);
 		WriteFile(stdinW, "\n", 1, NULL, NULL);
 	}
-	CloseHandle(stdinW);
+
+	// NOTE: keeps handles dangling for later
+	return PendingMenuProcess{
+		.pi = pi,
+		.stdinW = stdinW,
+		.stdoutR = stdoutR,
+	};
+}
+
+void showMenu(PendingMenuProcess menu)
+{
+	// Close stdin to trigger showing menu
+	CloseHandle(menu.stdinW);
 
 	// Read output
 	char out[32];
 	const DWORD readMax = sizeof(out) - 1;
 	DWORD totRead = 0, lastRead;
-	while (totRead < readMax && ReadFile(stdoutR, &out[totRead], readMax - totRead, &lastRead, NULL)) {
+	while (totRead < readMax && ReadFile(menu.stdoutR, &out[totRead], readMax - totRead, &lastRead, NULL)) {
 		totRead += lastRead;
 	}
 	out[totRead] = 0; // nullterm
 
 	// Clean up
-	CloseHandle(stdoutR);
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+	CloseHandle(menu.stdoutR);
+	CloseHandle(menu.pi.hProcess);
+	CloseHandle(menu.pi.hThread);
 
 	// Validate choice
 	int choice;
 	if (!StrToIntExA(out, STIF_SUPPORT_HEX, &choice) || choice < 0) {
-		err("no choice");
+		fprintf(stderr, "no choice\n");
+		return;
 	} else if ((u32)choice >= gEntries.size()) {
-		err("choice out of range");
+		fprintf(stderr, "choice out of range\n");
+		return;
 	}
 	const Entry& chosen = gEntries[choice];
 
@@ -219,18 +244,72 @@ void showMenu(char *menuCmd)
 	gHistory[chosen.path.c_str()] = chosen.historyScore + 1;
 }
 
+void runDaemon(DaemonData *dd)
+{
+	// Launch
+	dd->menu = launchMenu(dd->menuCmd);
+
+	// Register window class
+	WNDCLASS wc = {};
+	wc.lpszClassName = "wrun_daemon_class";
+	wc.lpfnWndProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+		auto dd = (DaemonData*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+		if (msg == WM_USER) {
+			if (dd->menuFuture.valid() && dd->menuFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+				fprintf(stderr, "disregarding menu request since it's still showing\n");
+				return (LRESULT)1;
+			}
+
+			printf("showing menu\n");
+			dd->menuFuture = std::async(std::launch::async, [dd] {
+				showMenu(dd->menu);
+				if (dd->useHistory) {
+					saveHistory(dd->historyPath);
+					organizeIndex();
+				}
+				dd->menu = launchMenu(dd->menuCmd);
+			});
+			return (LRESULT)0;
+		}
+		return DefWindowProc(hWnd, msg, wParam, lParam);
+	};
+	RegisterClass(&wc);
+
+	// Open
+	HWND hWnd = CreateWindow("wrun_daemon_class", "wrun", 0, 0, 0, 0, 0, 0, NULL, NULL, 0);
+	if (!hWnd) {
+		fprintf(stderr, "wrun daemon window creation failed");
+		exit(1);
+	}
+	SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)dd);
+
+	// Window loop
+	while (true) {
+		MSG msg;
+		while (GetMessageW(&msg, 0, 0, 0)) {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+}
+
 void usage()
 {
-	// TODO: daemonize flag: run in background and accept window message to show menu
 	// TODO: flag to enable sub-actions (aside from launch), stuff like "Open Directory" and "Remove from History"
-	// TODO: flag to run indexing on another thread and save for next launch
 	fprintf(stderr, "wrun <OPTIONS>\n"
 		"USAGE:\n"
 		"\t-menu <menu cmd>  menu command to invoke (required)\n"
+		"\t-daemonize        run in background\n"
 		"\t-Nhistory         don't load or save history\n"
 		"\t-Nstart           don't index start menu\n"
 		"\t-Npath            don't index PATH\n"
 		"\t+index <path>     index a custom path\n"
+		"DAEMON:\n"
+		"\tThe -daemonize flag will put wrun into the background\n"
+		"\tand show the menu on a WM_USER (0x400) window message.\n"
+		"\tYou can do this in e.g. AutoHotkey using:\n"
+		"\t\tDetectHiddenWindows, On\n"
+		"\t\tPostMessage, 0x400,,,, ahk_class wrun_daemon_class\n"
 	);
 	exit(1);
 }
@@ -240,11 +319,13 @@ int main(int argc, char **argv)
 	const auto historyPath = fs::path(std::getenv("APPDATA")).append("wrun_history.bin");
 
 	char *menuCmd = NULL;
-	bool useHistory = true, doIndexStartMenu = true, doIndexEnvPath = true;
+	bool daemonize = false, useHistory = true, doIndexStartMenu = true, doIndexEnvPath = true;
 	std::vector<std::string> customPaths;
 
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-Nhistory")) {
+		if (!strcmp(argv[i], "-daemonize")) {
+			daemonize = true;
+		} else if (!strcmp(argv[i], "-Nhistory")) {
 			useHistory = false;
 		} else if (!strcmp(argv[i], "-Nstart")) {
 			doIndexStartMenu = false;
@@ -274,10 +355,18 @@ int main(int argc, char **argv)
 		indexCustomPath(customPaths[i]);
 	}
 	organizeIndex();
-	showMenu(menuCmd);
-
-	if (useHistory) {
-		saveHistory(historyPath);
+	
+	if (daemonize) {
+		runDaemon(new DaemonData{
+			.menuCmd = menuCmd,
+			.useHistory = useHistory,
+			.historyPath = historyPath,
+		});
+	} else {
+		showMenu(launchMenu(menuCmd));
+		if (useHistory) {
+			saveHistory(historyPath);
+		}
 	}
 
 	return 0;
