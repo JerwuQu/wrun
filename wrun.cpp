@@ -235,13 +235,14 @@ void showMenu(PendingMenuProcess menu)
 		fprintf(stderr, "choice out of range\n");
 		return;
 	}
-	const Entry& chosen = gEntries[choice];
+	Entry& chosen = gEntries[choice];
 
 	// Open choice
 	ShellExecuteW(0, L"open", L"explorer", chosen.path.c_str(), 0, SW_SHOW);
 
 	// Put in history
-	gHistory[chosen.path.c_str()] = chosen.historyScore + 1;
+	chosen.historyScore++;
+	gHistory[chosen.path.c_str()] = chosen.historyScore;
 }
 
 void runDaemon(DaemonData *dd)
