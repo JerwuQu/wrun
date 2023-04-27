@@ -4,7 +4,9 @@ simple program launcher for windows
 
 Displays a menu like [wlines](https://github.com/JerwuQu/wlines) to launch programs.
 
-Basic usage: `wrun -menu "wlines -id"`
+Basic usage: `wrun --menu "wlines -id"`
+
+Advanced usage: See `wrun --help`
 
 ## License
 

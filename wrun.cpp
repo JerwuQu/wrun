@@ -3,6 +3,7 @@
 #include <set>
 #include <map>
 #include <algorithm>
+#include <functional>
 #include <filesystem>
 #include <future>
 #include <fstream>
@@ -38,12 +39,20 @@ struct PendingMenuProcess {
 	HANDLE stdinW, stdoutR;
 };
 
-struct DaemonData {
-	char *menuCmd;
-	bool useHistory;
+struct Options {
+	char *menuCmd = NULL;
+	bool daemonize = false, useActions = true, useHistory = true;
+	bool doIndexStartMenu = true, doIndexEnvPath = true;
 	std::filesystem::path historyPath;
+	std::vector<std::string> customPaths;
+};
+
+struct DaemonData {
+	const Options& opt;
 	PendingMenuProcess menu;
 	std::future<void> menuFuture;
+
+	DaemonData(const Options& opt) : opt(opt) {}
 };
 
 std::vector<IEntry*> gEntries;
@@ -71,6 +80,39 @@ struct PathEntry : public IEntry {
 		// Run & update history
 		ShellExecuteW(0, L"open", L"explorer", path.c_str(), 0, SW_SHOW);
 		gHistory[path] = getScore() + 1;
+	}
+
+	void exploreTo()
+	{
+		ShellExecuteW(0, L"open", L"explorer", (L"/select," + std::wstring(path.c_str())).c_str(), 0, SW_SHOW);
+	}
+
+	void removeFromHistory()
+	{
+		gHistory.erase(path);
+	}
+};
+
+struct ActionEntry : public IEntry {
+	std::u8string title;
+	std::function<void(void)> fn;
+
+	ActionEntry(const std::u8string& title, std::function<void(void)> fn) :
+		title(u8"[wrun] " + title), fn(fn) {}
+
+	const std::u8string& getTitle() const override 
+	{
+		return title;
+	}
+
+	int32_t getScore() const override 
+	{
+		return -1;
+	}
+
+	void run() override 
+	{
+		fn();
 	}
 };
 
@@ -148,8 +190,10 @@ void saveHistory(const fs::path& histFilePath)
 
 void organizeIndex()
 {
-	std::sort(gEntries.begin(), gEntries.end(), [](const IEntry* a, const IEntry* b) -> bool {
-		if (a->getScore() == b->getScore()) {
+	std::stable_sort(gEntries.begin(), gEntries.end(), [](const IEntry* a, const IEntry* b) -> bool {
+		if (a->getScore() < 0) {
+			return false;
+		} else if (a->getScore() == b->getScore()) {
 			return a->getTitle() < b->getTitle();
 		} else {
 			return a->getScore() > b->getScore();
@@ -161,6 +205,8 @@ void organizeIndex()
 // This makes it so that showing the menu is essentially instant
 PendingMenuProcess launchMenu(char *menuCmd)
 {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 	// Create pipes for menu
 	SECURITY_ATTRIBUTES sa = {
 		.nLength = sizeof(SECURITY_ATTRIBUTES),
@@ -184,6 +230,7 @@ PendingMenuProcess launchMenu(char *menuCmd)
 	WASSERT(CreateProcessA(NULL, menuCmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi));
 	CloseHandle(stdinR);
 	CloseHandle(stdoutW);
+#pragma GCC diagnostic pop
 
 	// Send menu to stdin
 	for (auto& entry : gEntries) {
@@ -199,7 +246,8 @@ PendingMenuProcess launchMenu(char *menuCmd)
 	};
 }
 
-void showMenu(PendingMenuProcess menu)
+const auto showMenu_run = [](IEntry* entry){ entry->run(); };
+void showMenu(PendingMenuProcess menu, std::function<void(IEntry*)> handler=showMenu_run)
 {
 	// Close stdin to trigger showing menu
 	CloseHandle(menu.stdinW);
@@ -227,13 +275,14 @@ void showMenu(PendingMenuProcess menu)
 		fprintf(stderr, "choice out of range\n");
 		return;
 	}
-	gEntries[choice]->run();
+
+	handler(gEntries[choice]);
 }
 
 void runDaemon(DaemonData *dd)
 {
 	// Launch
-	dd->menu = launchMenu(dd->menuCmd);
+	dd->menu = launchMenu(dd->opt.menuCmd);
 
 	// Register window class
 	WNDCLASS wc = {};
@@ -249,11 +298,11 @@ void runDaemon(DaemonData *dd)
 			printf("showing menu\n");
 			dd->menuFuture = std::async(std::launch::async, [dd] {
 				showMenu(dd->menu);
-				if (dd->useHistory) {
-					saveHistory(dd->historyPath);
+				if (dd->opt.useHistory) {
+					saveHistory(dd->opt.historyPath);
 					organizeIndex();
 				}
-				dd->menu = launchMenu(dd->menuCmd);
+				dd->menu = launchMenu(dd->opt.menuCmd);
 			});
 			return (LRESULT)0;
 		}
@@ -264,7 +313,7 @@ void runDaemon(DaemonData *dd)
 	// Open
 	HWND hWnd = CreateWindow("wrun_daemon_class", "wrun", 0, 0, 0, 0, 0, 0, NULL, NULL, 0);
 	if (!hWnd) {
-		fprintf(stderr, "wrun daemon window creation failed");
+		fprintf(stderr, "wrun daemon window creation failed\n");
 		exit(1);
 	}
 	SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)dd);
@@ -279,14 +328,65 @@ void runDaemon(DaemonData *dd)
 	}
 }
 
+void reloadIndex(const Options& opt)
+{
+	if (opt.useHistory) {
+		gHistory.clear();
+		loadHistory(opt.historyPath);
+	}
+
+	gEntries.clear();
+
+	if (opt.doIndexStartMenu) indexStartMenu();
+	if (opt.doIndexEnvPath) indexEnvPath();
+	for (const auto& cpath : opt.customPaths) {
+		indexDir(cpath);
+	}
+
+	if (opt.useActions) {
+		gEntries.push_back(new ActionEntry(u8"Explore path ->", [&]{
+			showMenu(launchMenu(opt.menuCmd), [](IEntry* entry) {
+				auto pathEntry = dynamic_cast<PathEntry*>(entry);
+				if (pathEntry == nullptr) {
+					fprintf(stderr, "not a PathEntry\n");
+				} else {
+					pathEntry->exploreTo();	
+				}
+			});
+		}));
+
+		gEntries.push_back(new ActionEntry(u8"Remove from history ->", [&]{
+			showMenu(launchMenu(opt.menuCmd), [](IEntry* entry) {
+				auto pathEntry = dynamic_cast<PathEntry*>(entry);
+				if (pathEntry == nullptr) {
+					fprintf(stderr, "not a PathEntry\n");
+				} else {
+					pathEntry->removeFromHistory();
+				}
+			});
+		}));
+
+		if (opt.daemonize) {
+			gEntries.push_back(new ActionEntry(u8"Reload index", [&]{
+				reloadIndex(opt);
+			}));
+			gEntries.push_back(new ActionEntry(u8"Stop daemon", [&]{
+				exit(0);
+			}));
+		}
+	}
+
+	organizeIndex();
+}
+
 void usage()
 {
-	// TODO: flag to enable sub-actions (aside from launch), stuff like "Open Directory" and "Remove from History"
 	fprintf(stderr, "wrun <OPTIONS>\n"
 		"USAGE:\n"
 		"\t--menu <menu cmd>  menu command to invoke (required)\n"
 		"\t--daemonize        run in background\n"
 		"\t--no-history       don't load or save history\n"
+		"\t--no-actions       don't include meta actions\n"
 		"\t--no-start         don't index start menu\n"
 		"\t--no-path          don't index PATH\n"
 		"\t--index <path>     index one or more custom paths\n"
@@ -302,56 +402,42 @@ void usage()
 
 int main(int argc, char **argv)
 {
-	const auto historyPath = fs::path(std::getenv("APPDATA")).append("wrun_history.bin");
-
-	char *menuCmd = NULL;
-	bool daemonize = false, useHistory = true, doIndexStartMenu = true, doIndexEnvPath = true;
-	std::vector<std::string> customPaths;
+	Options opt{};
+	opt.historyPath = fs::path(std::getenv("APPDATA")).append("wrun_history.bin");
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--daemonize")) {
-			daemonize = true;
+			opt.daemonize = true;
+		} else if (!strcmp(argv[i], "--no-actions")) {
+			opt.useActions = false;
 		} else if (!strcmp(argv[i], "--no-history")) {
-			useHistory = false;
+			opt.useHistory = false;
 		} else if (!strcmp(argv[i], "--no-start")) {
-			doIndexStartMenu = false;
+			opt.doIndexStartMenu = false;
 		} else if (!strcmp(argv[i], "--no-path")) {
-			doIndexEnvPath = false;
+			opt.doIndexEnvPath = false;
 		} else if (i + 1 == argc) {
 			usage();
 		} else if (!strcmp(argv[i], "--menu")) {
-			menuCmd = argv[++i];
+			opt.menuCmd = argv[++i];
 		} else if (!strcmp(argv[i], "--index")) {
-			customPaths.push_back(argv[++i]);
+			opt.customPaths.push_back(argv[++i]);
 		} else {
 			usage();
 		}
 	}
-	if (!menuCmd) {
+	if (!opt.menuCmd) {
 		usage();
 	}
 
-	if (useHistory) {
-		loadHistory(historyPath);
-	}
+	reloadIndex(opt);
 
-	if (doIndexStartMenu) indexStartMenu();
-	if (doIndexEnvPath) indexEnvPath();
-	for (size_t i = 0; i < customPaths.size(); i++) {
-		indexDir(customPaths[i]);
-	}
-	organizeIndex();
-
-	if (daemonize) {
-		runDaemon(new DaemonData{
-			.menuCmd = menuCmd,
-			.useHistory = useHistory,
-			.historyPath = historyPath,
-		});
+	if (opt.daemonize) {
+		runDaemon(new DaemonData(opt));
 	} else {
-		showMenu(launchMenu(menuCmd));
-		if (useHistory) {
-			saveHistory(historyPath);
+		showMenu(launchMenu(opt.menuCmd));
+		if (opt.useHistory) {
+			saveHistory(opt.historyPath);
 		}
 	}
 
